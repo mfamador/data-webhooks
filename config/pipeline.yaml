@@ -63,49 +63,6 @@ pipeline:
 output:
   switch:
     retry_until_success: true # will retry until writes to an output
-    cases:
-    # no errors while processing
-    - check: '!errored() && meta("dead_letter")|"false" == "false"'
-      output:
-        broker:
-          pattern: fan_out
-          outputs:
-          # store capability  
-          - resource: table_storage_capability
-            processors:
-            - bloblang: 
-                root = this.processed
-            - bloblang:
-                root = this.explode("capabilities")
-            - unarchive:
-                format: json_array
-            - bloblang: |
-                meta table_name = capabilities.tableName
-                root = capabilities.content
-          # store readings
-          - resource: table_storage_readings
-            processors:
-            - bloblang: |
-                deviceId = pre_processed.deviceId
-                packetId = pre_processed.packetId
-                channelId = pre_processed.samples.channelId
-                rawValue = pre_processed.samples.rawValue
-                readingTS = pre_processed.samples.timestamp
-                tenantId = tenantId
-          - resource: table_storage_last_values
-            processors:
-            - archive:
-                format: json_array
-            - type: last_values
-              plugin:
-                cache_resource: lastvaluescache
-              # TODO handle errors
-            - unarchive:
-                format: json_map
-            - bloblang: |   
-                root = this
-                ingestedAt = timestamp_unix()
-
     # DLQ
     - check: 'meta("dead_letter")|"false" == "true" || (errored() && meta("num_retries").number()|env("MAX_RETRIES").number() <= 1)'
       output:
