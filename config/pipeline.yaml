@@ -123,19 +123,19 @@ resources:
 
 metrics:
   prometheus:
-    prefix: reading_digestor
+    prefix: data_webhooks
 
 logger:
-  prefix: readings_digestor
+  prefix: data_webhooks
   level: ${LOGLEVEL:INFO}
   add_timestamp: true
   json_format: true
   static_fields:
-    '@service': readings_digestor
+    '@service': data_webhooks
 
 tracer:
   jaeger:
     agent_address: jaeger-agent.istio-system:6831
-    service_name: readings-digestor
+    service_name: data-webhooks
     sampler_type: const
     flush_interval: ""
