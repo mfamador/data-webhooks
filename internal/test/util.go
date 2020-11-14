@@ -4,7 +4,7 @@ package test
 import (
 	"errors"
 	"fmt"
-	"github.com/Jeffail/benthos/v3/lib/broker"
+	"github.com/mfamador/datawebhooks/lib/broker"
 	"strconv"
 	"strings"
 	"testing"
