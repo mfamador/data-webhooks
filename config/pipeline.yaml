@@ -1,0 +1,255 @@
+http:
+  address: ${HTTP_ADDRESS:0.0.0.0:4195}
+
+input:
+  broker:
+    inputs:
+    # input from data topic
+    - kafka_balanced:
+        addresses:
+        - ${KAFKA_ADDRESS:kafka:9093}
+        tls:
+          enabled: ${KAFKA_TLS_ENABLED:true}
+        sasl:
+          mechanism: ${KAFKA_SASL_MECHANISM}
+          user: ${KAFKA_USER:"$ConnectionString"}
+          password: ${KAFKA_PASSWORD:"Endpoint=sb://kafka/"}
+        topics:
+        - readings
+        client_id:  ${KAFKA_CLIENT_ID:data_webooks}
+        consumer_group: ${KAFKA_CONSUMER_GROUP:webhooks}
+      processors:
+      - catch: [ ]
+    # input from data-retries topic - retry queue
+    - kafka_balanced:
+        addresses:
+        - ${KAFKA_RETRIES_ADDRESS:kafka:9093}
+        tls:
+          enabled: ${KAFKA_TLS_ENABLED:true}
+        topics:
+        - readings-retries
+        sasl:
+          mechanism: ${KAFKA_SASL_MECHANISM}
+          user: ${KAFKA_RETRIES_USER:"$ConnectionString"}
+          password: ${KAFKA_RETRIES_PASSWORD}
+        client_id: ${KAFKA_CLIENT_ID:data_webooks}
+        consumer_group: ${KAFKA_CONSUMER_GROUP:webhooks}
+      processors:
+      - catch: [ ]
+      - bloblang: |
+          root = this.content
+          meta sleep = timestamp - timestamp_unix()
+          meta num_retries = num_retries
+      - log:
+          level: "INFO"
+          message: "Sleeping for ${!metadata:sleep}"
+      - sleep:
+          duration: "${!metadata:sleep}s"
+
+buffer:
+  type: none
+
+pipeline:
+  processors:
+  - switch:
+    - check: keep=="alive"
+      processors:
+      - bloblang: |
+          root = deleted()
+  - type: matcher
+    plugin:
+      subscribers_service_address: ${SUBSCRIBERS_SERVICE_ADDRESS}
+
+output:
+  switch:
+    retry_until_success: true # will retry until writes to an output
+    cases:
+    # no errors while processing
+    - check: '!errored() && meta("dead_letter")|"false" == "false"'
+      output:
+        broker:
+          pattern: fan_out
+          outputs:
+          # store capability  
+          - resource: table_storage_capability
+            processors:
+            - bloblang: 
+                root = this.processed
+            - bloblang:
+                root = this.explode("capabilities")
+            - unarchive:
+                format: json_array
+            - bloblang: |
+                meta table_name = capabilities.tableName
+                root = capabilities.content
+          # store readings
+          - resource: table_storage_readings
+            processors:
+            - bloblang: |
+                deviceId = pre_processed.deviceId
+                packetId = pre_processed.packetId
+                channelId = pre_processed.samples.channelId
+                rawValue = pre_processed.samples.rawValue
+                readingTS = pre_processed.samples.timestamp
+                tenantId = tenantId
+          - resource: table_storage_last_values
+            processors:
+            - archive:
+                format: json_array
+            - type: last_values
+              plugin:
+                cache_resource: lastvaluescache
+              # TODO handle errors
+            - unarchive:
+                format: json_map
+            - bloblang: |   
+                root = this
+                ingestedAt = timestamp_unix()
+
+    # DLQ
+    - check: 'meta("dead_letter")|"false" == "true" || (errored() && meta("num_retries").number()|env("MAX_RETRIES").number() <= 1)'
+      output:
+        resource: dead_letter
+        processors:
+        - log:
+            level: ERROR
+            message: "WRITING TO DEAD LETTER"   
+        - bloblang: |
+            root = match {
+              meta("dead_letter")|"false" == "true" => this
+              _ => this.pre_processed
+            }
+        - bloblang: |
+            root = this
+            samples = if this.samples.type() == "object" {
+              [samples]
+            }   
+            
+    # retry queue
+    - check: 'errored() && meta("dead_letter")|"false" == "false" && meta("num_retries").number()|env("MAX_RETRIES").number() > 1'
+      output:
+        resource: retry_queue
+        processors:
+        # fix to write a single message
+        - log:
+            level: ERROR
+            message: "WRITING TO RETRY BECAUSE: ${!error()}"      
+        - bloblang: |
+            content = this.pre_processed 
+            timestamp = timestamp_unix() + env("RETRY_INTERVAL").number()|600
+            num_retries = meta("num_retries").number()|env("MAX_RETRIES").number()|5 - 1
+        - bloblang: |
+            root = this
+            content.samples = if this.content.samples.type() == "object" {
+              [content.samples]
+            }  
+
+resources:
+  caches:
+    tokencache:
+      ristretto:
+        ttl: ${TOKEN_CACHE_TTL:600s}
+    assetscache:
+      ristretto:
+        ttl: ${ASSETS_CACHE_TTL:20m}
+    lastvaluescache:
+      redis:
+          url: tcp://default:${REDIS_PASSWORD}@${REDIS_HOST:localhost}:${REDIS_PORT:6380}
+          expiration: ${LASTVALUES_CACHE_TTL:20m}
+          tls:
+            enabled: ${REDIS_TLS_ENABLED:true}
+            skip_cert_verify: true
+  processors:
+    request_oauth2_token:
+      branch:
+        processors:
+        - cache:
+            resource: tokencache
+            operator: get
+            key: token
+        - switch:
+          - check: 'errored()'
+            processors:
+            - type: catch
+            - type: oauth2_token
+              plugin:
+                endpoint: ${IDENTITY_SERVICE_ADDRESS:http://identity.core:80}
+                client_id: ${IDENTITY_DATA_API_CLIENT_ID:data-api}
+                client_secret: ${IDENTITY_DATA_API_CLIENT_SECRET}
+                scopes:
+                - ${IDENTITY_DATA_API_SCOPE:data-api}
+            - switch:
+              - check: '!errored()'
+                processors:
+                - cache:
+                    resource: tokencache
+                    operator: set
+                    key: token
+                    value: '${! json() }'
+              - check: 'errored()'
+                processors:
+                - log:
+                    level: ERROR
+                    message: "OAuth plugin failed due to: ${!error()}" 
+        result_map: |
+          meta token = this
+
+  outputs:
+    table_storage_last_values:
+      table_storage:
+        storage_connection_string: ${AZURE_STORAGE_CONNECTION_STRING}
+        table_name: 'LastValues'
+        partition_key: '${!json("deviceId")}'
+        row_key: '${!json("channelId")}'
+        insert_type: 'INSERT_REPLACE'
+        max_in_flight: 5
+    table_storage_readings:
+      table_storage:
+        storage_connection_string: ${AZURE_STORAGE_CONNECTION_STRING}
+        table_name: 'Readings'
+        partition_key: '${!meta("msg_timestamp")}'
+        row_key: '${!uuid_v4()}'
+        max_in_flight: 5
+    table_storage_capability:
+      table_storage:
+        storage_connection_string: ${AZURE_STORAGE_CONNECTION_STRING}
+        table_name: '${!meta("table_name")}'
+        partition_key: '${!meta("msg_timestamp")}'
+        row_key: '${!uuid_v4()}'
+        max_in_flight: 5
+    dead_letter:
+      blob_storage:
+        storage_connection_string: ${AZURE_STORAGE_CONNECTION_STRING}
+        container: 'dead-letter-readings-digestor-${!timestamp("2006")}'
+        path: '${!timestamp("2006-01-02")}/${!timestamp_unix_nano()}.json'
+    retry_queue:
+      kafka:
+        addresses:
+        - ${KAFKA_RETRIES_ADDRESS:kafka:9093}
+        tls:
+          enabled: ${KAFKA_TLS_ENABLED:true}
+        topic: readings-retries
+        sasl:
+          mechanism: ${KAFKA_SASL_MECHANISM}
+          user: ${KAFKA_RETRIES_USER:"$ConnectionString"}
+          password: ${KAFKA_RETRIES_PASSWORD}
+        client_id: ${KAFKA_CLIENT_ID:readings_digestor}
+
+metrics:
+  prometheus:
+    prefix: reading_digestor
+
+logger:
+  prefix: readings_digestor
+  level: ${LOGLEVEL:INFO}
+  add_timestamp: true
+  json_format: true
+  static_fields:
+    '@service': readings_digestor
+
+tracer:
+  jaeger:
+    agent_address: jaeger-agent.istio-system:6831
+    service_name: readings-digestor
+    sampler_type: const
+    flush_interval: ""
