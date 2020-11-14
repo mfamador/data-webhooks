@@ -102,78 +102,8 @@ output:
             }  
 
 resources:
-  caches:
-    tokencache:
-      ristretto:
-        ttl: ${TOKEN_CACHE_TTL:600s}
-    assetscache:
-      ristretto:
-        ttl: ${ASSETS_CACHE_TTL:20m}
-    lastvaluescache:
-      redis:
-          url: tcp://default:${REDIS_PASSWORD}@${REDIS_HOST:localhost}:${REDIS_PORT:6380}
-          expiration: ${LASTVALUES_CACHE_TTL:20m}
-          tls:
-            enabled: ${REDIS_TLS_ENABLED:true}
-            skip_cert_verify: true
   processors:
-    request_oauth2_token:
-      branch:
-        processors:
-        - cache:
-            resource: tokencache
-            operator: get
-            key: token
-        - switch:
-          - check: 'errored()'
-            processors:
-            - type: catch
-            - type: oauth2_token
-              plugin:
-                endpoint: ${IDENTITY_SERVICE_ADDRESS:http://identity.core:80}
-                client_id: ${IDENTITY_DATA_API_CLIENT_ID:data-api}
-                client_secret: ${IDENTITY_DATA_API_CLIENT_SECRET}
-                scopes:
-                - ${IDENTITY_DATA_API_SCOPE:data-api}
-            - switch:
-              - check: '!errored()'
-                processors:
-                - cache:
-                    resource: tokencache
-                    operator: set
-                    key: token
-                    value: '${! json() }'
-              - check: 'errored()'
-                processors:
-                - log:
-                    level: ERROR
-                    message: "OAuth plugin failed due to: ${!error()}" 
-        result_map: |
-          meta token = this
-
   outputs:
-    table_storage_last_values:
-      table_storage:
-        storage_connection_string: ${AZURE_STORAGE_CONNECTION_STRING}
-        table_name: 'LastValues'
-        partition_key: '${!json("deviceId")}'
-        row_key: '${!json("channelId")}'
-        insert_type: 'INSERT_REPLACE'
-        max_in_flight: 5
-    table_storage_readings:
-      table_storage:
-        storage_connection_string: ${AZURE_STORAGE_CONNECTION_STRING}
-        table_name: 'Readings'
-        partition_key: '${!meta("msg_timestamp")}'
-        row_key: '${!uuid_v4()}'
-        max_in_flight: 5
-    table_storage_capability:
-      table_storage:
-        storage_connection_string: ${AZURE_STORAGE_CONNECTION_STRING}
-        table_name: '${!meta("table_name")}'
-        partition_key: '${!meta("msg_timestamp")}'
-        row_key: '${!uuid_v4()}'
-        max_in_flight: 5
     dead_letter:
       blob_storage:
         storage_connection_string: ${AZURE_STORAGE_CONNECTION_STRING}
